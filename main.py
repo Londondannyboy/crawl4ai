@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Crawl4AI Service for Railway - Simplified Working Version
-Focus on getting basic functionality working first
+Crawl4AI Service v5.0 - Multi-page crawling with URL discovery
+Adds support for crawling multiple pages and discovering URLs
 """
 from __future__ import annotations
 import asyncio
@@ -10,32 +10,26 @@ from datetime import datetime
 from typing import Optional, List, Dict, Any
 import json
 import re
+from urllib.parse import urljoin, urlparse
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 import uvicorn
 
 # Import Crawl4AI
 try:
     from crawl4ai import AsyncWebCrawler
+    from crawl4ai.async_configs import BrowserConfig, CrawlerRunConfig
     print("✅ Crawl4AI imported successfully")
 except ImportError as e:
     print(f"❌ Failed to import crawl4ai: {e}")
     sys.exit(1)
 
-# Check if Playwright is available
-try:
-    import playwright
-    print("✅ Playwright imported successfully")
-except ImportError as e:
-    print(f"❌ Failed to import playwright: {e}")
-    sys.exit(1)
-
 
 app = FastAPI(
     title="Crawl4AI Service",
-    description="Web scraping service",
-    version="4.0.0"
+    description="Web scraping service with multi-page support",
+    version="6.0.0"
 )
 
 
@@ -53,15 +47,32 @@ class CrawlRequest(BaseModel):
     max_pages: int = 1
 
 
+class DiscoverRequest(BaseModel):
+    """URL discovery request"""
+    url: str
+    pattern: Optional[str] = None  # e.g., "*/jobs/*" or "*/careers/*"
+    max_urls: int = 100
+    include_external: bool = False
+
+
+class CrawlManyRequest(BaseModel):
+    """Multi-URL crawling request"""
+    urls: List[str]
+    parallel: int = 5  # Number of parallel crawlers
+    delay_between: float = 0.5  # Delay between requests in seconds
+
+
 @app.get("/")
 async def root():
     return {
         "service": "Crawl4AI Service",
-        "version": "4.0.0",
+        "version": "6.0.0",
         "status": "running",
         "endpoints": {
-            "/scrape": "POST - Scrape a URL",
+            "/scrape": "POST - Scrape a single URL",
             "/crawl": "POST - Crawl pages (Quest worker compatibility)",
+            "/discover": "POST - Discover URLs from a page",
+            "/crawl-many": "POST - Crawl multiple URLs in parallel",
             "/health": "GET - Health check"
         }
     }
@@ -72,18 +83,250 @@ async def health():
     return {"status": "healthy", "timestamp": datetime.now().isoformat()}
 
 
+@app.post("/discover")
+async def discover_urls(request: DiscoverRequest):
+    """
+    Discover URLs from a page
+    For job boards, this will find all individual job URLs
+    """
+    print(f"🔍 Discovering URLs from: {request.url}")
+    
+    try:
+        async with AsyncWebCrawler(verbose=True) as crawler:
+            # Crawl the main page
+            result = await crawler.arun(
+                url=request.url,
+                bypass_cache=True
+            )
+            
+            discovered_urls = []
+            
+            # Special handling for Ashby boards
+            if "ashbyhq.com" in request.url and hasattr(result, 'html'):
+                print("   Detected Ashby board - extracting job URLs")
+                html = result.html
+                
+                # Extract job data from __appData
+                match = re.search(r'window\.__appData\s*=\s*({.*?});', html, re.DOTALL)
+                if match:
+                    try:
+                        app_data = json.loads(match.group(1))
+                        jobs = app_data.get('jobBoard', {}).get('jobPostings', [])
+                        
+                        # Build job URLs
+                        base_url = request.url.rstrip('/')
+                        for job in jobs:
+                            if job.get('isListed'):
+                                job_id = job.get('id')
+                                if job_id:
+                                    job_url = f"{base_url}/{job_id}"
+                                    discovered_urls.append({
+                                        'url': job_url,
+                                        'title': job.get('title', ''),
+                                        'type': 'job_posting'
+                                    })
+                        
+                        print(f"   ✅ Found {len(discovered_urls)} job URLs")
+                    except Exception as e:
+                        print(f"   ❌ Failed to parse Ashby data: {e}")
+            
+            # Generic link extraction for other sites
+            if not discovered_urls and hasattr(result, 'links'):
+                print("   Using generic link extraction")
+                base_domain = urlparse(request.url).netloc
+                
+                for link in result.links.get('internal', []):
+                    # Apply pattern filter if provided
+                    if request.pattern:
+                        import fnmatch
+                        if not fnmatch.fnmatch(link, request.pattern):
+                            continue
+                    
+                    # Check if it's likely a job URL
+                    if any(indicator in link.lower() for indicator in ['job', 'career', 'position', 'opening']):
+                        discovered_urls.append({
+                            'url': link,
+                            'title': '',
+                            'type': 'potential_job'
+                        })
+                    
+                    if len(discovered_urls) >= request.max_urls:
+                        break
+                
+                # Include external links if requested
+                if request.include_external:
+                    for link in result.links.get('external', [])[:10]:
+                        discovered_urls.append({
+                            'url': link,
+                            'title': '',
+                            'type': 'external'
+                        })
+            
+            return {
+                "success": True,
+                "url": request.url,
+                "urls_discovered": len(discovered_urls),
+                "urls": discovered_urls[:request.max_urls],
+                "timestamp": datetime.now().isoformat()
+            }
+            
+    except Exception as e:
+        print(f"❌ Error in discovery: {e}")
+        return {
+            "success": False,
+            "url": request.url,
+            "urls_discovered": 0,
+            "urls": [],
+            "error": str(e),
+            "timestamp": datetime.now().isoformat()
+        }
+
+
+@app.post("/crawl-many")
+async def crawl_many_urls(request: CrawlManyRequest):
+    """
+    Crawl multiple URLs efficiently
+    Uses Crawl4AI's arun_many() for parallel processing
+    """
+    print(f"🕷️ Crawling {len(request.urls)} URLs with {request.parallel} parallel crawlers")
+    
+    if not request.urls:
+        raise HTTPException(status_code=400, detail="No URLs provided")
+    
+    if len(request.urls) > 100:
+        raise HTTPException(status_code=400, detail="Maximum 100 URLs per request")
+    
+    results = []
+    
+    try:
+        # Create browser config for parallel crawling
+        browser_config = BrowserConfig(
+            headless=True,
+            viewport_width=1920,
+            viewport_height=1080
+        )
+        
+        async with AsyncWebCrawler(
+            config=browser_config,
+            verbose=True
+        ) as crawler:
+            # Process URLs in batches based on parallel limit
+            for i in range(0, len(request.urls), request.parallel):
+                batch_urls = request.urls[i:i + request.parallel]
+                print(f"   Processing batch: {i//request.parallel + 1} ({len(batch_urls)} URLs)")
+                
+                # Use arun_many for parallel crawling
+                batch_results = await crawler.arun_many(
+                    urls=batch_urls,
+                    bypass_cache=True
+                )
+                
+                # Process results
+                for url, result in zip(batch_urls, batch_results):
+                    if result.success:
+                        # Extract relevant content
+                        content = ""
+                        title = ""
+                        
+                        # Special handling for Ashby job detail pages
+                        if "ashbyhq.com" in url and "/" in url.split("ashbyhq.com/")[-1]:
+                            # This is a job detail page
+                            if hasattr(result, 'html'):
+                                html = result.html
+                                # Extract job data from __appData
+                                match = re.search(r'window\.__appData\s*=\s*({.*?});', html, re.DOTALL)
+                                if match:
+                                    try:
+                                        app_data = json.loads(match.group(1))
+                                        if 'posting' in app_data:
+                                            posting = app_data['posting']
+                                            title = posting.get('title', '')
+                                            
+                                            # Build structured content
+                                            content_parts = []
+                                            content_parts.append(f"# {title}\n")
+                                            content_parts.append(f"**Company:** {app_data.get('organization', {}).get('name', '')}")
+                                            content_parts.append(f"**Department:** {posting.get('departmentName', '')}")
+                                            content_parts.append(f"**Location:** {posting.get('locationName', '')}")
+                                            content_parts.append(f"**Type:** {posting.get('employmentType', '')}")
+                                            content_parts.append(f"**Workplace:** {posting.get('workplaceType', '')}\n")
+                                            
+                                            # Add description
+                                            if posting.get('descriptionPlainText'):
+                                                content_parts.append("## Description\n")
+                                                content_parts.append(posting['descriptionPlainText'])
+                                            
+                                            # Add compensation if available
+                                            if posting.get('scrapeableCompensationSalarySummary'):
+                                                content_parts.append(f"\n**Salary:** {posting['scrapeableCompensationSalarySummary']}")
+                                            
+                                            content = "\n".join(content_parts)
+                                            print(f"   ✅ Extracted Ashby job details: {title}")
+                                    except Exception as e:
+                                        print(f"   ❌ Failed to parse Ashby data: {e}")
+                                        content = result.markdown if hasattr(result, 'markdown') else ""
+                                else:
+                                    content = result.markdown if hasattr(result, 'markdown') else ""
+                            else:
+                                content = result.markdown if hasattr(result, 'markdown') else ""
+                        else:
+                            content = result.markdown if hasattr(result, 'markdown') else ""
+                            title = result.metadata.get("title", "") if hasattr(result, 'metadata') else ""
+                        
+                        results.append({
+                            'url': url,
+                            'success': True,
+                            'title': title,
+                            'content_length': len(content),
+                            'content': content[:10000]  # Increased limit for job descriptions
+                        })
+                    else:
+                        results.append({
+                            'url': url,
+                            'success': False,
+                            'error': str(result.error) if hasattr(result, 'error') else "Unknown error"
+                        })
+                
+                # Add delay between batches
+                if i + request.parallel < len(request.urls):
+                    await asyncio.sleep(request.delay_between)
+        
+        successful = sum(1 for r in results if r['success'])
+        
+        return {
+            "success": True,
+            "total_urls": len(request.urls),
+            "successful": successful,
+            "failed": len(request.urls) - successful,
+            "results": results,
+            "timestamp": datetime.now().isoformat()
+        }
+        
+    except Exception as e:
+        print(f"❌ Error in crawl-many: {e}")
+        import traceback
+        traceback.print_exc()
+        
+        return {
+            "success": False,
+            "total_urls": len(request.urls),
+            "successful": 0,
+            "failed": len(request.urls),
+            "results": [],
+            "error": str(e),
+            "timestamp": datetime.now().isoformat()
+        }
+
+
 @app.post("/scrape")
 async def scrape_url(request: ScrapeRequest):
     """
-    Simple scraping endpoint
-    For Ashby boards, we'll extract from the HTML source
+    Simple scraping endpoint (kept for compatibility)
     """
     print(f"🔍 Scraping: {request.url}")
     
     try:
-        # Create a basic crawler
         async with AsyncWebCrawler(verbose=True) as crawler:
-            # Just get the page
             result = await crawler.arun(
                 url=request.url,
                 bypass_cache=True,
@@ -93,42 +336,64 @@ async def scrape_url(request: ScrapeRequest):
             # Get content
             markdown = ""
             
-            # Special handling for Ashby boards
+            # Special handling for Ashby pages
             if "ashbyhq.com" in request.url and hasattr(result, 'html'):
-                print("   Detected Ashby board - extracting jobs from HTML")
                 html = result.html
-                
-                # Look for __appData in the HTML
                 match = re.search(r'window\.__appData\s*=\s*({.*?});', html, re.DOTALL)
+                
                 if match:
                     try:
                         app_data = json.loads(match.group(1))
-                        jobs = app_data.get('jobBoard', {}).get('jobPostings', [])
                         
-                        # Build markdown content
-                        lines = ["# Job Openings\n"]
-                        job_count = 0
+                        # Check if it's a job detail page
+                        if 'posting' in app_data:
+                            print("   Detected Ashby job detail page")
+                            posting = app_data['posting']
+                            
+                            # Build markdown from job posting data
+                            lines = [f"# {posting.get('title', 'Job Opening')}\n"]
+                            lines.append(f"**Company:** {app_data.get('organization', {}).get('name', '')}")
+                            lines.append(f"**Department:** {posting.get('departmentName', '')}")
+                            lines.append(f"**Location:** {posting.get('locationName', '')}")
+                            lines.append(f"**Type:** {posting.get('employmentType', '')}")
+                            lines.append(f"**Workplace:** {posting.get('workplaceType', '')}\n")
+                            
+                            if posting.get('descriptionPlainText'):
+                                lines.append("## Description\n")
+                                lines.append(posting['descriptionPlainText'])
+                            
+                            if posting.get('scrapeableCompensationSalarySummary'):
+                                lines.append(f"\n**Salary:** {posting['scrapeableCompensationSalarySummary']}")
+                            
+                            markdown = "\n".join(lines)
+                            print(f"   ✅ Extracted full job details: {posting.get('title')}")
+                            
+                        # Or it's a job board listing page
+                        elif 'jobBoard' in app_data:
+                            print("   Detected Ashby job board listing")
+                            jobs = app_data.get('jobBoard', {}).get('jobPostings', [])
                         
-                        for job in jobs:
-                            if job.get('isListed'):
-                                job_count += 1
-                                lines.append(f"\n## {job.get('title', 'Untitled')}")
-                                lines.append(f"**Department:** {job.get('departmentName', 'N/A')}")
-                                lines.append(f"**Location:** {job.get('locationName', 'N/A')}")
-                                lines.append(f"**Type:** {job.get('employmentType', 'N/A')}")
-                                lines.append(f"**Workplace:** {job.get('workplaceType', 'N/A')}")
-                                lines.append(f"**Posted:** {job.get('publishedDate', 'N/A')}")
-                        
-                        markdown = "\n".join(lines)
-                        print(f"   ✅ Extracted {job_count} jobs from Ashby board")
+                            lines = ["# Job Openings\n"]
+                            job_count = 0
+                            
+                            for job in jobs:
+                                if job.get('isListed'):
+                                    job_count += 1
+                                    lines.append(f"\n## {job.get('title', 'Untitled')}")
+                                    lines.append(f"**Department:** {job.get('departmentName', 'N/A')}")
+                                    lines.append(f"**Location:** {job.get('locationName', 'N/A')}")
+                                    lines.append(f"**Type:** {job.get('employmentType', 'N/A')}")
+                                    lines.append(f"**Workplace:** {job.get('workplaceType', 'N/A')}")
+                                    lines.append(f"**Posted:** {job.get('publishedDate', 'N/A')}")
+                            
+                            markdown = "\n".join(lines)
+                            print(f"   ✅ Extracted {job_count} jobs from Ashby board")
                     except Exception as e:
                         print(f"   ❌ Failed to parse Ashby data: {e}")
                         markdown = result.markdown if hasattr(result, 'markdown') else ""
                 else:
-                    print("   No __appData found, using regular markdown")
                     markdown = result.markdown if hasattr(result, 'markdown') else ""
             else:
-                # For non-Ashby sites, just use the markdown
                 markdown = result.markdown if hasattr(result, 'markdown') else ""
             
             return {
@@ -143,9 +408,6 @@ async def scrape_url(request: ScrapeRequest):
             
     except Exception as e:
         print(f"❌ Error: {e}")
-        import traceback
-        traceback.print_exc()
-        
         return {
             "success": False,
             "url": request.url,
@@ -160,8 +422,7 @@ async def scrape_url(request: ScrapeRequest):
 @app.post("/crawl")
 async def crawl_site(request: CrawlRequest):
     """
-    Quest worker compatibility endpoint
-    Returns the expected format
+    Quest worker compatibility endpoint (kept for backward compatibility)
     """
     print(f"🕷️ Crawling: {request.url} (Quest worker endpoint)")
     
@@ -173,7 +434,6 @@ async def crawl_site(request: CrawlRequest):
                 word_count_threshold=10
             )
             
-            # Get content - special handling for Ashby
             content = ""
             title = ""
             
@@ -206,7 +466,6 @@ async def crawl_site(request: CrawlRequest):
                 content = result.markdown if hasattr(result, 'markdown') else ""
                 title = result.metadata.get("title", "") if hasattr(result, 'metadata') else ""
             
-            # Return in Quest worker expected format
             return {
                 "success": bool(content),
                 "pages": [{
@@ -232,11 +491,16 @@ async def crawl_site(request: CrawlRequest):
 
 if __name__ == "__main__":
     print("="*60)
-    print("🚀 Starting Crawl4AI Service v4.0.0")
+    print("🚀 Starting Crawl4AI Service v6.0.0")
     print("="*60)
-    print("Features:")
-    print("  ✅ Ashby job board support (extracts from HTML)")
-    print("  ✅ Quest worker /crawl endpoint")
+    print("New Features:")
+    print("  ✅ URL discovery with /discover endpoint")
+    print("  ✅ Multi-page crawling with /crawl-many endpoint")
+    print("  ✅ Parallel processing support")
+    print("  ✅ Pattern-based URL filtering")
+    print("Existing Features:")
+    print("  ✅ Ashby job board support")
+    print("  ✅ Quest worker compatibility")
     print("  ✅ General web scraping")
     print("="*60)
     
