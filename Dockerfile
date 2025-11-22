@@ -47,5 +47,5 @@ COPY . .
 # Expose port for API
 EXPOSE 8000
 
-# Run the test server
-CMD ["python", "main.py"]
+# Run the v5 server with multi-page support
+CMD ["python", "main_v5.py"]
