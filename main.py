@@ -3,6 +3,7 @@
 Improved Crawl4AI Service for Railway
 Properly handles JavaScript rendering and various scraping strategies
 """
+from __future__ import annotations
 import asyncio
 import sys
 from datetime import datetime
@@ -33,7 +34,7 @@ class ScrapeRequest(BaseModel):
     url: HttpUrl
     # Basic options
     word_count_threshold: int = 10
-    excluded_tags: list[str] = ["form", "nav", "footer"]
+    excluded_tags: List[str] = ["form", "nav", "footer"]
     remove_overlay_elements: bool = True
     
     # JavaScript handling
@@ -167,8 +168,11 @@ async def scrape_url(request: ScrapeRequest):
             
             # Extract links from the page
             links = []
-            if result.links:
-                links = [link.get("href", "") for link in result.links[:100]]
+            if hasattr(result, 'links') and result.links:
+                try:
+                    links = [link.get("href", "") for link in list(result.links)[:100]]
+                except:
+                    links = []
             
             response = ScrapeResponse(
                 success=result.success,
@@ -237,8 +241,12 @@ async def crawl_site(request: CrawlRequest):
                     })
                     
                     # Extract and queue new links
-                    if result.links and len(pages) < request.max_pages:
-                        for link in result.links[:20]:  # Limit links per page
+                    if hasattr(result, 'links') and result.links and len(pages) < request.max_pages:
+                        try:
+                            link_list = list(result.links)[:20]  # Limit links per page
+                        except:
+                            link_list = []
+                        for link in link_list:
                             href = link.get("href", "")
                             if href and href.startswith("http"):
                                 if not request.include_external:
