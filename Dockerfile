@@ -48,4 +48,4 @@ COPY . .
 EXPOSE 8000
 
 # Run the v6 server with Ashby detail page support
-CMD ["python", "main_v6.py"]
+CMD ["python", "main.py"]
