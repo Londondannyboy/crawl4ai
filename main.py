@@ -21,6 +21,17 @@ try:
     from crawl4ai import AsyncWebCrawler
     from crawl4ai.async_configs import BrowserConfig, CrawlerRunConfig
     print("✅ Crawl4AI imported successfully")
+
+    # Try to import advanced features (may not be available in all versions)
+    try:
+        from crawl4ai.content_filter_strategy import BM25ContentFilter, PruningContentFilter
+        from crawl4ai.markdown_generation_strategy import DefaultMarkdownGenerator
+        HAS_CONTENT_FILTERS = True
+        print("✅ Content filters available (BM25, Pruning)")
+    except ImportError:
+        HAS_CONTENT_FILTERS = False
+        print("⚠️ Content filters not available in this version")
+
 except ImportError as e:
     print(f"❌ Failed to import crawl4ai: {e}")
     sys.exit(1)
@@ -62,17 +73,34 @@ class CrawlManyRequest(BaseModel):
     delay_between: float = 0.5  # Delay between requests in seconds
 
 
+class ArticleResearchRequest(BaseModel):
+    """Optimized article research request with topic-based filtering"""
+    urls: List[str]
+    topic: str  # Topic query for BM25 relevance filtering
+    keywords: List[str] = Field(default_factory=list)  # Additional keywords
+    parallel: int = 5
+    min_word_count: int = 50  # Minimum words per content block
+    use_pruning: bool = True  # Remove low-value content
+    use_bm25: bool = True  # Filter by topic relevance
+
+
 @app.get("/")
 async def root():
     return {
         "service": "Crawl4AI Service",
-        "version": "6.0.0",
+        "version": "7.0.0",
         "status": "running",
+        "features": {
+            "content_filters": HAS_CONTENT_FILTERS,
+            "bm25_filtering": HAS_CONTENT_FILTERS,
+            "pruning": HAS_CONTENT_FILTERS
+        },
         "endpoints": {
             "/scrape": "POST - Scrape a single URL",
             "/crawl": "POST - Crawl pages (Quest worker compatibility)",
             "/discover": "POST - Discover URLs from a page",
             "/crawl-many": "POST - Crawl multiple URLs in parallel",
+            "/crawl-articles": "POST - Optimized article research with BM25 filtering",
             "/health": "GET - Health check"
         }
     }
@@ -307,6 +335,154 @@ async def crawl_many_urls(request: CrawlManyRequest):
         import traceback
         traceback.print_exc()
         
+        return {
+            "success": False,
+            "total_urls": len(request.urls),
+            "successful": 0,
+            "failed": len(request.urls),
+            "results": [],
+            "error": str(e),
+            "timestamp": datetime.now().isoformat()
+        }
+
+
+@app.post("/crawl-articles")
+async def crawl_articles(request: ArticleResearchRequest):
+    """
+    Optimized article research endpoint with BM25 filtering.
+
+    Uses:
+    - BM25ContentFilter: Filters content by relevance to topic
+    - PruningContentFilter: Removes low-value content (sidebars, ads)
+    - Higher word_count_threshold: Skips thin content
+    - remove_overlay_elements: Removes popups/modals
+    """
+    print(f"📰 Article research: {len(request.urls)} URLs, topic: '{request.topic}'")
+
+    if not request.urls:
+        raise HTTPException(status_code=400, detail="No URLs provided")
+
+    if len(request.urls) > 100:
+        raise HTTPException(status_code=400, detail="Maximum 100 URLs per request")
+
+    results = []
+
+    try:
+        # Build optimized config for article research
+        browser_config = BrowserConfig(
+            headless=True,
+            viewport_width=1920,
+            viewport_height=1080
+        )
+
+        # Build CrawlerRunConfig with optimizations
+        run_config_kwargs = {
+            "word_count_threshold": request.min_word_count,
+            "exclude_external_links": True,
+            "remove_overlay_elements": True,
+            "process_iframes": True,
+            "bypass_cache": True
+        }
+
+        # Add content filters if available
+        if HAS_CONTENT_FILTERS and (request.use_bm25 or request.use_pruning):
+            # Build query from topic + keywords
+            query = request.topic
+            if request.keywords:
+                query += " " + " ".join(request.keywords)
+
+            if request.use_bm25:
+                # BM25 filters content by relevance to topic
+                bm25_filter = BM25ContentFilter(
+                    user_query=query,
+                    bm25_threshold=1.0  # Relevance threshold
+                )
+                md_generator = DefaultMarkdownGenerator(content_filter=bm25_filter)
+                run_config_kwargs["markdown_generator"] = md_generator
+                print(f"   Using BM25 filter with query: '{query}'")
+            elif request.use_pruning:
+                # Pruning removes low-value content
+                prune_filter = PruningContentFilter(
+                    threshold=0.4,
+                    threshold_type="fixed",
+                    min_word_threshold=request.min_word_count
+                )
+                md_generator = DefaultMarkdownGenerator(content_filter=prune_filter)
+                run_config_kwargs["markdown_generator"] = md_generator
+                print("   Using Pruning filter")
+
+        run_config = CrawlerRunConfig(**run_config_kwargs)
+
+        async with AsyncWebCrawler(
+            config=browser_config,
+            verbose=True
+        ) as crawler:
+            # Process URLs in batches
+            for i in range(0, len(request.urls), request.parallel):
+                batch_urls = request.urls[i:i + request.parallel]
+                print(f"   Batch {i//request.parallel + 1}: {len(batch_urls)} URLs")
+
+                # Use arun_many for parallel crawling
+                batch_results = await crawler.arun_many(
+                    urls=batch_urls,
+                    config=run_config
+                )
+
+                for url, result in zip(batch_urls, batch_results):
+                    if result.success:
+                        # Get filtered/fit markdown if available, else raw
+                        content = ""
+                        if hasattr(result, 'markdown_v2') and result.markdown_v2:
+                            # fit_markdown is the BM25/pruned version
+                            if hasattr(result.markdown_v2, 'fit_markdown'):
+                                content = result.markdown_v2.fit_markdown or ""
+                            if not content and hasattr(result.markdown_v2, 'raw_markdown'):
+                                content = result.markdown_v2.raw_markdown or ""
+                        if not content:
+                            content = result.markdown if hasattr(result, 'markdown') else ""
+
+                        title = result.metadata.get("title", "") if hasattr(result, 'metadata') and result.metadata else ""
+
+                        results.append({
+                            'url': url,
+                            'success': True,
+                            'title': title,
+                            'content_length': len(content),
+                            'content': content[:15000],  # 15k chars for articles
+                            'filtered': HAS_CONTENT_FILTERS and (request.use_bm25 or request.use_pruning)
+                        })
+                    else:
+                        results.append({
+                            'url': url,
+                            'success': False,
+                            'error': str(result.error) if hasattr(result, 'error') else "Unknown error"
+                        })
+
+                # Small delay between batches
+                if i + request.parallel < len(request.urls):
+                    await asyncio.sleep(0.3)
+
+        successful = sum(1 for r in results if r.get('success'))
+
+        return {
+            "success": True,
+            "total_urls": len(request.urls),
+            "successful": successful,
+            "failed": len(request.urls) - successful,
+            "topic": request.topic,
+            "filters_used": {
+                "bm25": request.use_bm25 and HAS_CONTENT_FILTERS,
+                "pruning": request.use_pruning and HAS_CONTENT_FILTERS
+            },
+            "results": results,
+            "timestamp": datetime.now().isoformat()
+        }
+
+    except Exception as e:
+        print(f"❌ Error in crawl-articles: {e}")
+        import traceback
+        traceback.print_exc()
+
         return {
             "success": False,
             "total_urls": len(request.urls),
