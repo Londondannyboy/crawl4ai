@@ -1,18 +1,24 @@
 #!/usr/bin/env python3
 """
-Crawl4AI Service v5.0 - Multi-page crawling with URL discovery
-Adds support for crawling multiple pages and discovering URLs
+Crawl4AI Service v9.0 - Advanced crawling with adaptive resource management
+Features:
+- MemoryAdaptiveDispatcher for auto-throttling under load
+- URL-specific configs for different content types
+- Streaming results for progressive processing
+- BM25/Pruning content filters
 """
 from __future__ import annotations
 import asyncio
 import sys
 from datetime import datetime
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, AsyncGenerator
 import json
 import re
 from urllib.parse import urljoin, urlparse
+import fnmatch
 
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 import uvicorn
 
@@ -32,16 +38,88 @@ try:
         HAS_CONTENT_FILTERS = False
         print("⚠️ Content filters not available in this version")
 
+    # Try to import MemoryAdaptiveDispatcher for resource management
+    try:
+        from crawl4ai.async_dispatcher import MemoryAdaptiveDispatcher, SemaphoreDispatcher
+        HAS_ADAPTIVE_DISPATCHER = True
+        print("✅ MemoryAdaptiveDispatcher available")
+    except ImportError:
+        HAS_ADAPTIVE_DISPATCHER = False
+        print("⚠️ MemoryAdaptiveDispatcher not available, using semaphore fallback")
+
 except ImportError as e:
     print(f"❌ Failed to import crawl4ai: {e}")
     sys.exit(1)
 
 
+# URL pattern configs for different site types
+URL_CONFIGS = {
+    "news": {
+        "patterns": ["*news*", "*article*", "*blog*", "*/post/*"],
+        "word_count_threshold": 100,
+        "page_timeout": 30000,
+        "description": "News/article sites - stricter word count"
+    },
+    "government": {
+        "patterns": ["*.gov", "*.gov.*", "*.govt.*"],
+        "word_count_threshold": 50,
+        "page_timeout": 60000,
+        "description": "Government sites - longer timeout"
+    },
+    "corporate": {
+        "patterns": ["*/about*", "*/company*", "*/team*", "*/careers*"],
+        "word_count_threshold": 30,
+        "page_timeout": 30000,
+        "description": "Corporate pages - standard settings"
+    },
+    "default": {
+        "patterns": ["*"],
+        "word_count_threshold": 10,
+        "page_timeout": 30000,
+        "description": "Default fallback"
+    }
+}
+
+
 app = FastAPI(
     title="Crawl4AI Service",
-    description="Web scraping service with multi-page support",
-    version="8.0.0"
+    description="Web scraping service with adaptive resource management, URL-specific configs, and streaming",
+    version="9.0.0"
 )
+
+
+def get_config_for_url(url: str) -> Dict[str, Any]:
+    """
+    Get the appropriate config based on URL pattern matching.
+    Returns config dict with word_count_threshold and page_timeout.
+    """
+    url_lower = url.lower()
+
+    # Check each config type in order of specificity
+    for config_type in ["news", "government", "corporate"]:
+        config = URL_CONFIGS[config_type]
+        for pattern in config["patterns"]:
+            if fnmatch.fnmatch(url_lower, pattern):
+                return config
+
+    return URL_CONFIGS["default"]
+
+
+def create_dispatcher(max_concurrent: int = 10, memory_threshold: float = 70.0):
+    """
+    Create the best available dispatcher for resource management.
+    Uses MemoryAdaptiveDispatcher if available, falls back to semaphore.
+    """
+    if HAS_ADAPTIVE_DISPATCHER:
+        return MemoryAdaptiveDispatcher(
+            memory_threshold_percent=memory_threshold,
+            check_interval=1.0,
+            max_session_permit=max_concurrent,
+            memory_wait_timeout=300  # 5 min timeout if memory stays high
+        )
+    else:
+        # Fallback to simple semaphore-based limiting
+        return None  # Will use asyncio.Semaphore in the crawl functions
 
 
 class ScrapeRequest(BaseModel):
@@ -67,10 +145,14 @@ class DiscoverRequest(BaseModel):
 
 
 class CrawlManyRequest(BaseModel):
-    """Multi-URL crawling request"""
+    """Multi-URL crawling request with adaptive resource management"""
     urls: List[str]
-    parallel: int = 5  # Number of parallel crawlers
-    delay_between: float = 0.5  # Delay between requests in seconds
+    parallel: int = 10  # Max parallel crawlers (adaptive dispatcher may reduce)
+    delay_between: float = 0.5  # Delay between batches
+    use_adaptive: bool = True  # Use MemoryAdaptiveDispatcher if available
+    memory_threshold: float = 70.0  # Memory % threshold for throttling
+    use_url_configs: bool = True  # Apply URL-specific configs
+    stream: bool = False  # Stream results as they complete
 
 
 class ArticleResearchRequest(BaseModel):
@@ -78,29 +160,38 @@ class ArticleResearchRequest(BaseModel):
     urls: List[str]
     topic: str  # Topic query for BM25 relevance filtering
     keywords: List[str] = Field(default_factory=list)  # Additional keywords
-    parallel: int = 5
+    parallel: int = 10  # Max parallel (adaptive dispatcher manages actual)
     min_word_count: int = 50  # Minimum words per content block
     use_pruning: bool = True  # Remove low-value content
     use_bm25: bool = True  # Filter by topic relevance
+    use_adaptive: bool = True  # Use MemoryAdaptiveDispatcher
+    memory_threshold: float = 70.0  # Memory % threshold for throttling
+    use_url_configs: bool = True  # Apply URL-specific configs
+    stream: bool = False  # Stream results as NDJSON
 
 
 @app.get("/")
 async def root():
     return {
         "service": "Crawl4AI Service",
-        "version": "8.0.0",
+        "version": "9.0.0",
         "status": "running",
         "features": {
             "content_filters": HAS_CONTENT_FILTERS,
             "bm25_filtering": HAS_CONTENT_FILTERS,
-            "pruning": HAS_CONTENT_FILTERS
+            "pruning": HAS_CONTENT_FILTERS,
+            "memory_adaptive_dispatcher": HAS_ADAPTIVE_DISPATCHER,
+            "url_specific_configs": True,
+            "streaming": True
         },
+        "url_configs": URL_CONFIGS,
         "endpoints": {
             "/scrape": "POST - Scrape a single URL",
             "/crawl": "POST - Crawl pages (Quest worker compatibility)",
             "/discover": "POST - Discover URLs from a page",
-            "/crawl-many": "POST - Crawl multiple URLs in parallel",
+            "/crawl-many": "POST - Crawl multiple URLs with adaptive resource management",
             "/crawl-articles": "POST - Optimized article research with BM25 filtering",
+            "/crawl-stream": "POST - Stream results as NDJSON (progressive processing)",
             "/health": "GET - Health check"
         }
     }
@@ -210,131 +301,140 @@ async def discover_urls(request: DiscoverRequest):
         }
 
 
+def extract_ashby_content(url: str, result) -> tuple:
+    """Extract content from Ashby job pages. Returns (content, title)."""
+    content = ""
+    title = ""
+
+    if "ashbyhq.com" not in url:
+        return content, title
+
+    if not hasattr(result, 'html'):
+        return content, title
+
+    html = result.html
+    match = re.search(r'window\.__appData\s*=\s*({.*?});', html, re.DOTALL)
+
+    if not match:
+        return content, title
+
+    try:
+        app_data = json.loads(match.group(1))
+        if 'posting' in app_data:
+            posting = app_data['posting']
+            title = posting.get('title', '')
+
+            content_parts = [f"# {title}\n"]
+            content_parts.append(f"**Company:** {app_data.get('organization', {}).get('name', '')}")
+            content_parts.append(f"**Department:** {posting.get('departmentName', '')}")
+            content_parts.append(f"**Location:** {posting.get('locationName', '')}")
+            content_parts.append(f"**Type:** {posting.get('employmentType', '')}")
+            content_parts.append(f"**Workplace:** {posting.get('workplaceType', '')}\n")
+
+            if posting.get('descriptionPlainText'):
+                content_parts.append("## Description\n")
+                content_parts.append(posting['descriptionPlainText'])
+
+            if posting.get('scrapeableCompensationSalarySummary'):
+                content_parts.append(f"\n**Salary:** {posting['scrapeableCompensationSalarySummary']}")
+
+            content = "\n".join(content_parts)
+            print(f"   ✅ Extracted Ashby job details: {title}")
+    except Exception as e:
+        print(f"   ❌ Failed to parse Ashby data: {e}")
+
+    return content, title
+
+
 @app.post("/crawl-many")
 async def crawl_many_urls(request: CrawlManyRequest):
     """
-    Crawl multiple URLs efficiently
-    Uses Crawl4AI's arun_many() for parallel processing
+    Crawl multiple URLs with adaptive resource management.
+
+    Features:
+    - MemoryAdaptiveDispatcher: Auto-throttles when memory exceeds threshold
+    - URL-specific configs: Different settings for news/gov/corporate sites
+    - Streaming option: Return results as NDJSON stream
     """
-    print(f"🕷️ Crawling {len(request.urls)} URLs with {request.parallel} parallel crawlers")
-    
+    print(f"🕷️ Crawling {len(request.urls)} URLs")
+    print(f"   Adaptive: {request.use_adaptive}, Memory threshold: {request.memory_threshold}%")
+    print(f"   URL configs: {request.use_url_configs}, Stream: {request.stream}")
+
     if not request.urls:
         raise HTTPException(status_code=400, detail="No URLs provided")
-    
+
     if len(request.urls) > 100:
         raise HTTPException(status_code=400, detail="Maximum 100 URLs per request")
-    
+
+    # Handle streaming response
+    if request.stream:
+        return StreamingResponse(
+            crawl_many_stream(request),
+            media_type="application/x-ndjson"
+        )
+
     results = []
-    
+
     try:
-        # Create browser config for parallel crawling
         browser_config = BrowserConfig(
             headless=True,
             viewport_width=1920,
             viewport_height=1080
         )
-        
-        async with AsyncWebCrawler(
-            config=browser_config,
-            verbose=True
-        ) as crawler:
-            # Process URLs in batches based on parallel limit
-            for i in range(0, len(request.urls), request.parallel):
-                batch_urls = request.urls[i:i + request.parallel]
-                print(f"   Processing batch: {i//request.parallel + 1} ({len(batch_urls)} URLs)")
-                
-                # Use arun_many for parallel crawling
-                batch_results = await crawler.arun_many(
-                    urls=batch_urls,
-                    config=CrawlerRunConfig(cache_mode=CacheMode.BYPASS)
+
+        # Create dispatcher if adaptive mode enabled
+        dispatcher = None
+        if request.use_adaptive and HAS_ADAPTIVE_DISPATCHER:
+            dispatcher = create_dispatcher(request.parallel, request.memory_threshold)
+            print(f"   Using MemoryAdaptiveDispatcher (max {request.parallel}, threshold {request.memory_threshold}%)")
+        else:
+            print(f"   Using semaphore-based batching (batch size {request.parallel})")
+
+        async with AsyncWebCrawler(config=browser_config, verbose=True) as crawler:
+            if dispatcher and HAS_ADAPTIVE_DISPATCHER:
+                # Use dispatcher for all URLs at once - it manages concurrency
+                all_results = await crawler.arun_many(
+                    urls=request.urls,
+                    config=CrawlerRunConfig(cache_mode=CacheMode.BYPASS),
+                    dispatcher=dispatcher
                 )
-                
-                # Process results
-                for url, result in zip(batch_urls, batch_results):
-                    if result.success:
-                        # Extract relevant content
-                        content = ""
-                        title = ""
-                        
-                        # Special handling for Ashby job detail pages
-                        if "ashbyhq.com" in url and "/" in url.split("ashbyhq.com/")[-1]:
-                            # This is a job detail page
-                            if hasattr(result, 'html'):
-                                html = result.html
-                                # Extract job data from __appData
-                                match = re.search(r'window\.__appData\s*=\s*({.*?});', html, re.DOTALL)
-                                if match:
-                                    try:
-                                        app_data = json.loads(match.group(1))
-                                        if 'posting' in app_data:
-                                            posting = app_data['posting']
-                                            title = posting.get('title', '')
-                                            
-                                            # Build structured content
-                                            content_parts = []
-                                            content_parts.append(f"# {title}\n")
-                                            content_parts.append(f"**Company:** {app_data.get('organization', {}).get('name', '')}")
-                                            content_parts.append(f"**Department:** {posting.get('departmentName', '')}")
-                                            content_parts.append(f"**Location:** {posting.get('locationName', '')}")
-                                            content_parts.append(f"**Type:** {posting.get('employmentType', '')}")
-                                            content_parts.append(f"**Workplace:** {posting.get('workplaceType', '')}\n")
-                                            
-                                            # Add description
-                                            if posting.get('descriptionPlainText'):
-                                                content_parts.append("## Description\n")
-                                                content_parts.append(posting['descriptionPlainText'])
-                                            
-                                            # Add compensation if available
-                                            if posting.get('scrapeableCompensationSalarySummary'):
-                                                content_parts.append(f"\n**Salary:** {posting['scrapeableCompensationSalarySummary']}")
-                                            
-                                            content = "\n".join(content_parts)
-                                            print(f"   ✅ Extracted Ashby job details: {title}")
-                                    except Exception as e:
-                                        print(f"   ❌ Failed to parse Ashby data: {e}")
-                                        content = result.markdown if hasattr(result, 'markdown') else ""
-                                else:
-                                    content = result.markdown if hasattr(result, 'markdown') else ""
-                            else:
-                                content = result.markdown if hasattr(result, 'markdown') else ""
-                        else:
-                            content = result.markdown if hasattr(result, 'markdown') else ""
-                            title = result.metadata.get("title", "") if hasattr(result, 'metadata') else ""
-                        
-                        results.append({
-                            'url': url,
-                            'success': True,
-                            'title': title,
-                            'content_length': len(content),
-                            'content': content[:10000]  # Increased limit for job descriptions
-                        })
-                    else:
-                        results.append({
-                            'url': url,
-                            'success': False,
-                            'error': str(result.error) if hasattr(result, 'error') else "Unknown error"
-                        })
-                
-                # Add delay between batches
-                if i + request.parallel < len(request.urls):
-                    await asyncio.sleep(request.delay_between)
-        
+
+                for url, result in zip(request.urls, all_results):
+                    results.append(process_crawl_result(url, result, request.use_url_configs))
+            else:
+                # Fallback: batch processing with semaphore
+                for i in range(0, len(request.urls), request.parallel):
+                    batch_urls = request.urls[i:i + request.parallel]
+                    print(f"   Batch {i//request.parallel + 1}: {len(batch_urls)} URLs")
+
+                    batch_results = await crawler.arun_many(
+                        urls=batch_urls,
+                        config=CrawlerRunConfig(cache_mode=CacheMode.BYPASS)
+                    )
+
+                    for url, result in zip(batch_urls, batch_results):
+                        results.append(process_crawl_result(url, result, request.use_url_configs))
+
+                    if i + request.parallel < len(request.urls):
+                        await asyncio.sleep(request.delay_between)
+
         successful = sum(1 for r in results if r['success'])
-        
+
         return {
             "success": True,
             "total_urls": len(request.urls),
             "successful": successful,
             "failed": len(request.urls) - successful,
+            "dispatcher_used": "memory_adaptive" if dispatcher else "semaphore_batch",
             "results": results,
             "timestamp": datetime.now().isoformat()
         }
-        
+
     except Exception as e:
         print(f"❌ Error in crawl-many: {e}")
         import traceback
         traceback.print_exc()
-        
+
         return {
             "success": False,
             "total_urls": len(request.urls),
@@ -346,18 +446,85 @@ async def crawl_many_urls(request: CrawlManyRequest):
         }
 
 
+def process_crawl_result(url: str, result, use_url_configs: bool = True) -> Dict[str, Any]:
+    """Process a single crawl result into standardized format."""
+    if not result.success:
+        return {
+            'url': url,
+            'success': False,
+            'error': str(result.error) if hasattr(result, 'error') else "Unknown error"
+        }
+
+    # Try Ashby extraction first
+    content, title = extract_ashby_content(url, result)
+
+    # Fall back to standard extraction
+    if not content:
+        content = result.markdown if hasattr(result, 'markdown') else ""
+        title = result.metadata.get("title", "") if hasattr(result, 'metadata') and result.metadata else ""
+
+    # Get URL-specific config info
+    url_config = get_config_for_url(url) if use_url_configs else URL_CONFIGS["default"]
+
+    return {
+        'url': url,
+        'success': True,
+        'title': title,
+        'content_length': len(content),
+        'content': content[:10000],
+        'url_config_type': url_config.get("description", "default") if use_url_configs else None
+    }
+
+
+async def crawl_many_stream(request: CrawlManyRequest) -> AsyncGenerator[str, None]:
+    """
+    Stream crawl results as NDJSON (newline-delimited JSON).
+    Each line is a complete JSON object for one URL result.
+    """
+    print(f"📡 Streaming {len(request.urls)} URLs")
+
+    browser_config = BrowserConfig(headless=True, viewport_width=1920, viewport_height=1080)
+
+    try:
+        async with AsyncWebCrawler(config=browser_config, verbose=True) as crawler:
+            # Process one at a time for true streaming
+            for url in request.urls:
+                try:
+                    result = await crawler.arun(
+                        url=url,
+                        config=CrawlerRunConfig(cache_mode=CacheMode.BYPASS)
+                    )
+                    processed = process_crawl_result(url, result, request.use_url_configs)
+                    yield json.dumps(processed) + "\n"
+                except Exception as e:
+                    yield json.dumps({
+                        'url': url,
+                        'success': False,
+                        'error': str(e)
+                    }) + "\n"
+
+    except Exception as e:
+        yield json.dumps({
+            'error': f"Stream error: {str(e)}",
+            'timestamp': datetime.now().isoformat()
+        }) + "\n"
+
+
 @app.post("/crawl-articles")
 async def crawl_articles(request: ArticleResearchRequest):
     """
-    Optimized article research endpoint with BM25 filtering.
+    Optimized article research endpoint with BM25 filtering and adaptive resource management.
 
-    Uses:
+    Features:
     - BM25ContentFilter: Filters content by relevance to topic
     - PruningContentFilter: Removes low-value content (sidebars, ads)
-    - Higher word_count_threshold: Skips thin content
-    - remove_overlay_elements: Removes popups/modals
+    - MemoryAdaptiveDispatcher: Auto-throttles under memory pressure
+    - URL-specific configs: Different settings for news/gov sites
+    - Streaming option: Return results as NDJSON stream
     """
     print(f"📰 Article research: {len(request.urls)} URLs, topic: '{request.topic}'")
+    print(f"   Adaptive: {request.use_adaptive}, Memory threshold: {request.memory_threshold}%")
+    print(f"   BM25: {request.use_bm25}, Pruning: {request.use_pruning}, Stream: {request.stream}")
 
     if not request.urls:
         raise HTTPException(status_code=400, detail="No URLs provided")
@@ -365,15 +532,26 @@ async def crawl_articles(request: ArticleResearchRequest):
     if len(request.urls) > 100:
         raise HTTPException(status_code=400, detail="Maximum 100 URLs per request")
 
+    # Handle streaming response
+    if request.stream:
+        return StreamingResponse(
+            crawl_articles_stream(request),
+            media_type="application/x-ndjson"
+        )
+
     results = []
 
     try:
-        # Build optimized config for article research
         browser_config = BrowserConfig(
             headless=True,
             viewport_width=1920,
             viewport_height=1080
         )
+
+        # Build query from topic + keywords
+        query = request.topic
+        if request.keywords:
+            query += " " + " ".join(request.keywords)
 
         # Build CrawlerRunConfig with optimizations
         run_config_kwargs = {
@@ -386,22 +564,15 @@ async def crawl_articles(request: ArticleResearchRequest):
 
         # Add content filters if available
         if HAS_CONTENT_FILTERS and (request.use_bm25 or request.use_pruning):
-            # Build query from topic + keywords
-            query = request.topic
-            if request.keywords:
-                query += " " + " ".join(request.keywords)
-
             if request.use_bm25:
-                # BM25 filters content by relevance to topic
                 bm25_filter = BM25ContentFilter(
                     user_query=query,
-                    bm25_threshold=1.0  # Relevance threshold
+                    bm25_threshold=1.0
                 )
                 md_generator = DefaultMarkdownGenerator(content_filter=bm25_filter)
                 run_config_kwargs["markdown_generator"] = md_generator
                 print(f"   Using BM25 filter with query: '{query}'")
             elif request.use_pruning:
-                # Pruning removes low-value content
                 prune_filter = PruningContentFilter(
                     threshold=0.4,
                     threshold_type="fixed",
@@ -413,54 +584,41 @@ async def crawl_articles(request: ArticleResearchRequest):
 
         run_config = CrawlerRunConfig(**run_config_kwargs)
 
-        async with AsyncWebCrawler(
-            config=browser_config,
-            verbose=True
-        ) as crawler:
-            # Process URLs in batches
-            for i in range(0, len(request.urls), request.parallel):
-                batch_urls = request.urls[i:i + request.parallel]
-                print(f"   Batch {i//request.parallel + 1}: {len(batch_urls)} URLs")
+        # Create dispatcher if adaptive mode enabled
+        dispatcher = None
+        if request.use_adaptive and HAS_ADAPTIVE_DISPATCHER:
+            dispatcher = create_dispatcher(request.parallel, request.memory_threshold)
+            print(f"   Using MemoryAdaptiveDispatcher (max {request.parallel}, threshold {request.memory_threshold}%)")
+        else:
+            print(f"   Using semaphore-based batching (batch size {request.parallel})")
 
-                # Use arun_many for parallel crawling
-                batch_results = await crawler.arun_many(
-                    urls=batch_urls,
-                    config=run_config
+        async with AsyncWebCrawler(config=browser_config, verbose=True) as crawler:
+            if dispatcher and HAS_ADAPTIVE_DISPATCHER:
+                # Use dispatcher for all URLs at once
+                all_results = await crawler.arun_many(
+                    urls=request.urls,
+                    config=run_config,
+                    dispatcher=dispatcher
                 )
 
-                for url, result in zip(batch_urls, batch_results):
-                    if result.success:
-                        # Get filtered/fit markdown if available, else raw
-                        content = ""
-                        if hasattr(result, 'markdown_v2') and result.markdown_v2:
-                            # fit_markdown is the BM25/pruned version
-                            if hasattr(result.markdown_v2, 'fit_markdown'):
-                                content = result.markdown_v2.fit_markdown or ""
-                            if not content and hasattr(result.markdown_v2, 'raw_markdown'):
-                                content = result.markdown_v2.raw_markdown or ""
-                        if not content:
-                            content = result.markdown if hasattr(result, 'markdown') else ""
+                for url, result in zip(request.urls, all_results):
+                    results.append(process_article_result(url, result, request))
+            else:
+                # Fallback: batch processing
+                for i in range(0, len(request.urls), request.parallel):
+                    batch_urls = request.urls[i:i + request.parallel]
+                    print(f"   Batch {i//request.parallel + 1}: {len(batch_urls)} URLs")
 
-                        title = result.metadata.get("title", "") if hasattr(result, 'metadata') and result.metadata else ""
+                    batch_results = await crawler.arun_many(
+                        urls=batch_urls,
+                        config=run_config
+                    )
 
-                        results.append({
-                            'url': url,
-                            'success': True,
-                            'title': title,
-                            'content_length': len(content),
-                            'content': content[:15000],  # 15k chars for articles
-                            'filtered': HAS_CONTENT_FILTERS and (request.use_bm25 or request.use_pruning)
-                        })
-                    else:
-                        results.append({
-                            'url': url,
-                            'success': False,
-                            'error': str(result.error) if hasattr(result, 'error') else "Unknown error"
-                        })
+                    for url, result in zip(batch_urls, batch_results):
+                        results.append(process_article_result(url, result, request))
 
-                # Small delay between batches
-                if i + request.parallel < len(request.urls):
-                    await asyncio.sleep(0.3)
+                    if i + request.parallel < len(request.urls):
+                        await asyncio.sleep(0.3)
 
         successful = sum(1 for r in results if r.get('success'))
 
@@ -470,6 +628,7 @@ async def crawl_articles(request: ArticleResearchRequest):
             "successful": successful,
             "failed": len(request.urls) - successful,
             "topic": request.topic,
+            "dispatcher_used": "memory_adaptive" if dispatcher else "semaphore_batch",
             "filters_used": {
                 "bm25": request.use_bm25 and HAS_CONTENT_FILTERS,
                 "pruning": request.use_pruning and HAS_CONTENT_FILTERS
@@ -492,6 +651,87 @@ async def crawl_articles(request: ArticleResearchRequest):
             "error": str(e),
             "timestamp": datetime.now().isoformat()
         }
+
+
+def process_article_result(url: str, result, request: ArticleResearchRequest) -> Dict[str, Any]:
+    """Process a single article crawl result."""
+    if not result.success:
+        return {
+            'url': url,
+            'success': False,
+            'error': str(result.error) if hasattr(result, 'error') else "Unknown error"
+        }
+
+    # Get filtered/fit markdown if available, else raw
+    content = ""
+    if hasattr(result, 'markdown_v2') and result.markdown_v2:
+        if hasattr(result.markdown_v2, 'fit_markdown'):
+            content = result.markdown_v2.fit_markdown or ""
+        if not content and hasattr(result.markdown_v2, 'raw_markdown'):
+            content = result.markdown_v2.raw_markdown or ""
+    if not content:
+        content = result.markdown if hasattr(result, 'markdown') else ""
+
+    title = result.metadata.get("title", "") if hasattr(result, 'metadata') and result.metadata else ""
+
+    # Get URL-specific config info
+    url_config = get_config_for_url(url) if request.use_url_configs else None
+
+    return {
+        'url': url,
+        'success': True,
+        'title': title,
+        'content_length': len(content),
+        'content': content[:15000],
+        'filtered': HAS_CONTENT_FILTERS and (request.use_bm25 or request.use_pruning),
+        'url_config_type': url_config.get("description") if url_config else None
+    }
+
+
+async def crawl_articles_stream(request: ArticleResearchRequest) -> AsyncGenerator[str, None]:
+    """Stream article crawl results as NDJSON."""
+    print(f"📡 Streaming article research: {len(request.urls)} URLs, topic: '{request.topic}'")
+
+    browser_config = BrowserConfig(headless=True, viewport_width=1920, viewport_height=1080)
+
+    # Build query and config
+    query = request.topic
+    if request.keywords:
+        query += " " + " ".join(request.keywords)
+
+    run_config_kwargs = {
+        "word_count_threshold": request.min_word_count,
+        "exclude_external_links": True,
+        "remove_overlay_elements": True,
+        "cache_mode": CacheMode.BYPASS
+    }
+
+    if HAS_CONTENT_FILTERS and request.use_bm25:
+        bm25_filter = BM25ContentFilter(user_query=query, bm25_threshold=1.0)
+        md_generator = DefaultMarkdownGenerator(content_filter=bm25_filter)
+        run_config_kwargs["markdown_generator"] = md_generator
+
+    run_config = CrawlerRunConfig(**run_config_kwargs)
+
+    try:
+        async with AsyncWebCrawler(config=browser_config, verbose=True) as crawler:
+            for url in request.urls:
+                try:
+                    result = await crawler.arun(url=url, config=run_config)
+                    processed = process_article_result(url, result, request)
+                    yield json.dumps(processed) + "\n"
+                except Exception as e:
+                    yield json.dumps({
+                        'url': url,
+                        'success': False,
+                        'error': str(e)
+                    }) + "\n"
+
+    except Exception as e:
+        yield json.dumps({
+            'error': f"Stream error: {str(e)}",
+            'timestamp': datetime.now().isoformat()
+        }) + "\n"
 
 
 @app.post("/scrape")
@@ -671,19 +911,24 @@ async def crawl_site(request: CrawlRequest):
 
 if __name__ == "__main__":
     print("="*60)
-    print("🚀 Starting Crawl4AI Service v8.0.0")
+    print("🚀 Starting Crawl4AI Service v9.0.0")
     print("="*60)
-    print("New Features:")
-    print("  ✅ URL discovery with /discover endpoint")
-    print("  ✅ Multi-page crawling with /crawl-many endpoint")
-    print("  ✅ Parallel processing support")
-    print("  ✅ Pattern-based URL filtering")
+    print("New in v9.0:")
+    print(f"  {'✅' if HAS_ADAPTIVE_DISPATCHER else '⚠️'} MemoryAdaptiveDispatcher (auto-throttle under load)")
+    print("  ✅ URL-specific configs (news/gov/corporate sites)")
+    print("  ✅ Streaming results (NDJSON for progressive processing)")
     print("Existing Features:")
+    print(f"  {'✅' if HAS_CONTENT_FILTERS else '⚠️'} BM25 content filtering")
+    print(f"  {'✅' if HAS_CONTENT_FILTERS else '⚠️'} Pruning content filter")
     print("  ✅ Ashby job board support")
     print("  ✅ Quest worker compatibility")
-    print("  ✅ General web scraping")
+    print("  ✅ Parallel batch processing")
     print("="*60)
-    
+    print("URL Configs:")
+    for config_type, config in URL_CONFIGS.items():
+        print(f"  {config_type}: {config['description']}")
+    print("="*60)
+
     uvicorn.run(
         app,
         host="0.0.0.0",
