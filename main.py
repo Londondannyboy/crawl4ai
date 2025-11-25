@@ -18,7 +18,7 @@ import uvicorn
 
 # Import Crawl4AI
 try:
-    from crawl4ai import AsyncWebCrawler
+    from crawl4ai import AsyncWebCrawler, CacheMode
     from crawl4ai.async_configs import BrowserConfig, CrawlerRunConfig
     print("✅ Crawl4AI imported successfully")
 
@@ -40,7 +40,7 @@ except ImportError as e:
 app = FastAPI(
     title="Crawl4AI Service",
     description="Web scraping service with multi-page support",
-    version="6.0.0"
+    version="8.0.0"
 )
 
 
@@ -88,7 +88,7 @@ class ArticleResearchRequest(BaseModel):
 async def root():
     return {
         "service": "Crawl4AI Service",
-        "version": "7.0.0",
+        "version": "8.0.0",
         "status": "running",
         "features": {
             "content_filters": HAS_CONTENT_FILTERS,
@@ -124,7 +124,7 @@ async def discover_urls(request: DiscoverRequest):
             # Crawl the main page
             result = await crawler.arun(
                 url=request.url,
-                bypass_cache=True
+                config=CrawlerRunConfig(cache_mode=CacheMode.BYPASS)
             )
             
             discovered_urls = []
@@ -246,7 +246,7 @@ async def crawl_many_urls(request: CrawlManyRequest):
                 # Use arun_many for parallel crawling
                 batch_results = await crawler.arun_many(
                     urls=batch_urls,
-                    bypass_cache=True
+                    config=CrawlerRunConfig(cache_mode=CacheMode.BYPASS)
                 )
                 
                 # Process results
@@ -381,7 +381,7 @@ async def crawl_articles(request: ArticleResearchRequest):
             "exclude_external_links": True,
             "remove_overlay_elements": True,
             "process_iframes": True,
-            "bypass_cache": True
+            "cache_mode": CacheMode.BYPASS
         }
 
         # Add content filters if available
@@ -505,8 +505,10 @@ async def scrape_url(request: ScrapeRequest):
         async with AsyncWebCrawler(verbose=True) as crawler:
             result = await crawler.arun(
                 url=request.url,
-                bypass_cache=True,
-                word_count_threshold=request.word_count_threshold
+                config=CrawlerRunConfig(
+                    cache_mode=CacheMode.BYPASS,
+                    word_count_threshold=request.word_count_threshold
+                )
             )
             
             # Get content
@@ -606,8 +608,10 @@ async def crawl_site(request: CrawlRequest):
         async with AsyncWebCrawler(verbose=True) as crawler:
             result = await crawler.arun(
                 url=request.url,
-                bypass_cache=True,
-                word_count_threshold=10
+                config=CrawlerRunConfig(
+                    cache_mode=CacheMode.BYPASS,
+                    word_count_threshold=10
+                )
             )
             
             content = ""
@@ -667,7 +671,7 @@ async def crawl_site(request: CrawlRequest):
 
 if __name__ == "__main__":
     print("="*60)
-    print("🚀 Starting Crawl4AI Service v6.0.0")
+    print("🚀 Starting Crawl4AI Service v8.0.0")
     print("="*60)
     print("New Features:")
     print("  ✅ URL discovery with /discover endpoint")
